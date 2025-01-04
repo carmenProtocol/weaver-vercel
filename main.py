@@ -15,13 +15,14 @@ from executor import Executor
 from analyzer import calculate_pnl
 from state import State
 from config import Config, TradingPairConfig
+import asyncio
 
 # Trading parameters
 SYMBOL = TradingPairConfig.TRADING_PAIR
 SLEEP_TIME = 10  # Sleep time in seconds between iterations
 STATUS_INTERVAL = 3600  # Status update interval in seconds
 
-def print_strategy_info(state: State, pnl: Dict[str, float], message: str, initial_price: float) -> None:
+async def print_strategy_info(state: State, pnl: Dict[str, float], message: str, initial_price: float, logger=None) -> None:
     """
     Выводит подробную информацию о состоянии стратегии.
     
@@ -30,6 +31,7 @@ def print_strategy_info(state: State, pnl: Dict[str, float], message: str, initi
         pnl: Словарь с метриками P&L
         message: Сообщение о текущем действии стратегии
         initial_price: Начальная цена
+        logger: Логгер для записи в Supabase
     """
     print(f"\n=== {message} ===")
     print(f"Текущая цена: ${state.current_price:.2f}")
@@ -37,65 +39,77 @@ def print_strategy_info(state: State, pnl: Dict[str, float], message: str, initi
     print(f"ETH баланс: {state.current_eth:.6f} ETH (${state.current_eth * state.current_price:.2f})")
     print(f"USDT баланс: ${state.current_usd:.2f}")
     print(f"P&L: ${pnl['total']:.2f} ({pnl['percentage']:.2f}%)")
+    
+    if logger:
+        await logger.update_state(state)
+        await logger.log_pnl(pnl)
+    
     if state.hedges:
         print("\nАктивные хеджи:")
         for hedge_num, hedge in state.hedges.items():
             print(f"Хедж {hedge_num}: {hedge['size']:.4f} контрактов по ${hedge['price']:.2f}")
+        
+        if logger:
+            await logger.log_hedges(state.hedges)
+    
     print("=" * 50 + "\n")
 
-def main_loop(state: State, current_price: float, executor: Executor, initial_price: float) -> State:
+async def main_loop(state: State, current_price: float, executor: Executor, initial_price: float, logger=None) -> State:
     """
     Основной цикл торговой стратегии.
-    
-    Args:
-        state: Текущее состояние стратегии
-        current_price: Текущая цена
-        executor: Исполнитель торговых операций
-        initial_price: Начальная цена
-    
-    Returns:
-        State: Обновленное состояние стратегии
     """
     state.current_price = current_price
     last_action = None
+    action_type = None
 
     # Управление хеджами
     if state.current_price < state.entry_price:
         manage_hedges(state)
         if state.hedges != state.prev_hedges:
             last_action = "Обновление хедж-позиций"
+            action_type = "hedge"
             state.prev_hedges = state.hedges.copy()
 
     # Покупка при снижении
     if state.current_price <= state.buffer:
         buy_on_lower(state)
         last_action = "Покупка при снижении цены"
+        action_type = "buy"
 
     # Ребалансировка при возврате к entry
     if state.buffer < state.current_price <= state.entry_price * 1.01:
         rebalance_at_entry(state)
         if state.current_price > state.entry_price:
             last_action = "Ребалансировка при возврате к точке входа"
+            action_type = "rebalance"
 
     # Если была торговая операция, выводим информацию
     if last_action:
         pnl = calculate_pnl(state, initial_price)
-        print_strategy_info(state, pnl, last_action, initial_price)
+        await print_strategy_info(state, pnl, last_action, initial_price, logger)
+        
+        if logger:
+            await logger.write(last_action, log_type='trade', action=action_type)
 
     return state
 
-def main():
+async def main(logger=None):
     """
     Основная функция торгового бота.
     """
     try:
         print("\n=== Инициализация торговой стратегии ===")
+        if logger:
+            await logger.write("Инициализация торговой стратегии", log_type='info', action='init')
         
         # Создаем подключение к бирже
         exchange = create_okx_exchange()
         print("Проверка подключения к бирже...")
         exchange.load_markets()
         print("Подключение успешно!")
+        
+        if logger:
+            await logger.write("Подключение к бирже успешно", log_type='info', action='connect')
         
         # Создаем исполнителя
         executor = Executor(exchange)
@@ -144,7 +158,10 @@ def main():
                 # Получаем текущие данные рынка
                 current_price = scan_market(SYMBOL)
                 if not current_price:
-                    print("Предупреждение: Не удалось получить текущую цену, пропускаем итерацию")
+                    error_msg = "Предупреждение: Не удалось получить текущую цену, пропускаем итерацию"
+                    print(error_msg)
+                    if logger:
+                        await logger.write(error_msg, log_type='warning', action='market_scan')
                     continue
                 
                 # Получаем текущие балансы только если прошел интервал или была торговля
@@ -152,23 +169,29 @@ def main():
                     usdt_balance, eth_balance = get_balance(exchange)
                     state.update_balances(eth_balance, usdt_balance)
                     pnl = calculate_pnl(state, initial_price)
-                    print_strategy_info(state, pnl, "Периодический статус", initial_price)
+                    await print_strategy_info(state, pnl, "Периодический статус", initial_price, logger)
                     last_status_time = current_time
                 
                 # Выполняем основной цикл
-                state = main_loop(state, current_price, executor, initial_price)
+                state = await main_loop(state, current_price, executor, initial_price, logger)
                 
                 # Пауза перед следующей итерацией
-                time.sleep(SLEEP_TIME)
+                await asyncio.sleep(SLEEP_TIME)
                 
             except Exception as e:
-                print(f"Ошибка в торговом цикле: {str(e)}")
-                time.sleep(SLEEP_TIME)
+                error_msg = f"Ошибка в торговом цикле: {str(e)}"
+                print(error_msg)
+                if logger:
+                    await logger.write(error_msg, log_type='error', action='trading_loop', is_error=True)
+                await asyncio.sleep(SLEEP_TIME)
                 continue
     
     except Exception as e:
-        print(f"Критическая ошибка: {str(e)}")
+        error_msg = f"Критическая ошибка: {str(e)}"
+        print(error_msg)
+        if logger:
+            await logger.write(error_msg, log_type='error', action='critical', is_error=True)
         return
 
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main()) 

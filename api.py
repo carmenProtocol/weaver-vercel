@@ -1,15 +1,20 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, WebSocketState
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
-from typing import Set
 from datetime import datetime
 import main as trading_bot
 import threading
-from queue import Queue
 import logging
 import traceback
+from typing import Optional
+import os
+from dotenv import load_dotenv
+from supabase import create_client, Client
+import asyncpg
+
+# Загружаем переменные окружения
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -17,19 +22,15 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Добавляем CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Supabase connection
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables must be set")
 
-active_websockets: Set[WebSocket] = set()
-message_queue = Queue()
-bot_status = {"running": False, "error": None}
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# HTML страница с интерфейсом
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -65,239 +66,227 @@ HTML = """
                 color: #ffff00;
             }
         </style>
+        <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
     </head>
     <body>
         <div id="terminal"></div>
         <script>
-            let ws = null;
-            let reconnectAttempts = 0;
-            const maxReconnectAttempts = 5;
-            const reconnectDelay = 5000;
             const terminal = document.getElementById('terminal');
-            let pingInterval = null;
+            let lastTimestamp = null;
 
             function addMessage(message, type = 'normal') {
-                const timestamp = new Date().toLocaleTimeString();
+                const timestamp = new Date(message.created_at).toLocaleTimeString();
                 const messageDiv = document.createElement('div');
-                messageDiv.className = `message ${type}`;
-                messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${message}`;
+                messageDiv.className = `message ${message.is_error ? 'error' : type}`;
+                messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${message.content}`;
                 terminal.appendChild(messageDiv);
                 terminal.scrollTop = terminal.scrollHeight;
             }
 
-            function setupPingInterval() {
-                if (pingInterval) {
-                    clearInterval(pingInterval);
-                }
-                pingInterval = setInterval(() => {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        try {
-                            ws.send(JSON.stringify({ type: 'ping' }));
-                        } catch (e) {
-                            addMessage('Error sending ping: ' + e.message, 'error');
-                            ws.close();
-                        }
-                    }
-                }, 15000);
-            }
-
-            function connect() {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.close();
-                }
-
-                addMessage('Connecting to server...', 'system');
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = `${protocol}//${window.location.host}/ws`;
-                addMessage(`Attempting to connect to ${wsUrl}`, 'system');
-                
+            async function fetchNewLogs() {
                 try {
-                    ws = new WebSocket(wsUrl);
+                    const query = lastTimestamp ? `?after_timestamp=${lastTimestamp}` : '';
+                    const response = await axios.get(`/logs${query}`);
+                    const logs = response.data;
                     
-                    ws.onmessage = function(event) {
-                        try {
-                            const data = JSON.parse(event.data);
-                            if (data.type === 'pong') {
-                                return; // Игнорируем pong сообщения в выводе
-                            }
-                            addMessage(data.message, data.error ? 'error' : 'normal');
-                        } catch (e) {
-                            addMessage('Error parsing message: ' + e.message, 'error');
-                        }
-                    };
-                    
-                    ws.onclose = function(event) {
-                        if (pingInterval) {
-                            clearInterval(pingInterval);
-                            pingInterval = null;
-                        }
-
-                        const reason = event.reason || 'Unknown reason';
-                        const code = event.code;
-                        addMessage(`WebSocket connection closed. Code: ${code}, Reason: ${reason}`, 'error');
-                        
-                        if (reconnectAttempts < maxReconnectAttempts) {
-                            reconnectAttempts++;
-                            const delay = reconnectDelay * reconnectAttempts;
-                            addMessage(`Reconnecting in ${delay/1000} seconds (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`, 'system');
-                            setTimeout(connect, delay);
-                        } else {
-                            addMessage(`Failed to reconnect after ${maxReconnectAttempts} attempts. Please refresh the page.`, 'error');
-                        }
-                    };
-
-                    ws.onerror = function(error) {
-                        addMessage('WebSocket error occurred', 'error');
-                        console.error('WebSocket error:', error);
-                    };
-
-                    ws.onopen = function() {
-                        reconnectAttempts = 0;
-                        addMessage('Connected to server', 'system');
-                        setupPingInterval();
-                    };
-                } catch (e) {
-                    addMessage('Error creating WebSocket connection: ' + e.message, 'error');
+                    if (logs.length > 0) {
+                        logs.forEach(log => {
+                            addMessage(log);
+                            lastTimestamp = log.created_at;
+                        });
+                    }
+                } catch (error) {
+                    console.error('Error fetching logs:', error);
                 }
             }
 
-            connect();
+            async function fetchStatus() {
+                try {
+                    const response = await axios.get('/status');
+                    const status = response.data;
+                    
+                    if (status.error) {
+                        addMessage({ 
+                            content: `Bot Error: ${status.error}`,
+                            created_at: new Date().toISOString(),
+                            is_error: true 
+                        }, 'error');
+                    }
+                } catch (error) {
+                    console.error('Error fetching status:', error);
+                }
+            }
 
-            window.onbeforeunload = function() {
-                if (ws) {
-                    ws.close();
-                }
-                if (pingInterval) {
-                    clearInterval(pingInterval);
-                }
-            };
+            // Получаем логи каждые 2 секунды
+            setInterval(fetchNewLogs, 2000);
+            
+            // Проверяем статус каждые 5 секунд
+            setInterval(fetchStatus, 5000);
+
+            // Загружаем начальные логи
+            fetchNewLogs();
+            fetchStatus();
         </script>
     </body>
 </html>
 """
 
-class TerminalPrinter:
-    def __init__(self, queue: Queue):
-        self.queue = queue
+class SupabaseLogger:
+    def __init__(self, state=None):
+        self.buffer = []
+        self.last_flush = datetime.now()
+        self.state = state
 
-    def write(self, text: str):
+    async def write(self, text: str, log_type='info', action=None, is_error=False):
         if text.strip():
-            self.queue.put({"message": text.strip(), "error": False})
+            log_entry = {
+                "content": text.strip(),
+                "is_error": is_error,
+                "log_type": log_type,
+                "action": action
+            }
+            
+            # Добавляем состояние, если оно доступно
+            if self.state:
+                log_entry.update({
+                    "price": self.state.current_price,
+                    "eth_balance": self.state.current_eth,
+                    "usdt_balance": self.state.current_usd,
+                    "pnl_total": None,  # Будет обновлено при расчете PNL
+                    "pnl_percentage": None  # Будет обновлено при расчете PNL
+                })
+            
+            self.buffer.append(log_entry)
             logger.info(text.strip())
+            
+            if len(self.buffer) >= 100 or (datetime.now() - self.last_flush).seconds >= 1:
+                await self.flush()
 
-    def flush(self):
-        pass
+    async def update_state(self, state):
+        self.state = state
 
-async def broadcast_message(message: dict):
-    disconnected = set()
-    for websocket in active_websockets:
+    async def log_pnl(self, pnl):
+        if self.buffer and self.buffer[-1]:
+            self.buffer[-1]["pnl_total"] = pnl.get('total')
+            self.buffer[-1]["pnl_percentage"] = pnl.get('percentage')
+
+    async def log_hedges(self, hedges):
         try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_json(message)
+            # Сначала удаляем все существующие хеджи
+            supabase.table('hedges').delete().neq('id', 0).execute()
+            
+            # Затем добавляем текущие хеджи
+            if hedges:
+                hedge_entries = [
+                    {
+                        "hedge_num": num,
+                        "size": hedge['size'],
+                        "price": hedge['price']
+                    }
+                    for num, hedge in hedges.items()
+                ]
+                supabase.table('hedges').insert(hedge_entries).execute()
         except Exception as e:
-            logger.error(f"Error broadcasting message: {e}")
-            disconnected.add(websocket)
-    
-    active_websockets.difference_update(disconnected)
+            logger.error(f"Error updating hedges: {e}")
+
+    async def flush(self):
+        if self.buffer:
+            try:
+                data = supabase.table('logs').insert(self.buffer).execute()
+                self.buffer.clear()
+                self.last_flush = datetime.now()
+            except Exception as e:
+                logger.error(f"Error writing to Supabase: {e}")
 
 @app.get("/")
 async def get():
     return HTMLResponse(HTML)
 
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy" if bot_status["running"] and not bot_status["error"] else "unhealthy",
-        "bot_running": bot_status["running"],
-        "bot_error": bot_status["error"],
-        "connections": len(active_websockets),
-        "timestamp": datetime.now().isoformat()
-    }
-
-async def keep_alive(websocket: WebSocket):
+@app.get("/logs")
+async def get_logs(after_timestamp: Optional[str] = None):
     try:
-        while True:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                await websocket.send_json({"type": "ping"})
-            await asyncio.sleep(15)
-    except Exception as e:
-        logger.error(f"Keep-alive error: {e}")
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    try:
-        logger.info(f"WebSocket headers: {websocket.headers}")
-        logger.info(f"Client connecting from: {websocket.client}")
+        query = supabase.table('logs').select('*').order('created_at', desc=False).limit(100)
         
-        await websocket.accept()
-        active_websockets.add(websocket)
-        logger.info(f"New WebSocket connection. Active connections: {len(active_websockets)}")
-        
-        await websocket.send_json({"message": "Connected to Weaver Trading Bot", "error": False})
-        
-        # Запускаем keep-alive в отдельной задаче
-        keep_alive_task = asyncio.create_task(keep_alive(websocket))
-        
-        try:
-            while True:
-                try:
-                    data = await websocket.receive_json()
-                    if data.get("type") == "ping":
-                        await websocket.send_json({"type": "pong"})
-                        continue
-                        
-                    # Обработка других типов сообщений
-                    logger.info(f"Received message: {data}")
-                    
-                except json.JSONDecodeError:
-                    logger.error("Invalid JSON received")
-                    continue
-                    
-                # Отправляем сообщения из очереди
-                while not message_queue.empty():
-                    try:
-                        message = message_queue.get_nowait()
-                        if websocket.client_state == WebSocketState.CONNECTED:
-                            await websocket.send_json(message)
-                    except Exception as e:
-                        logger.error(f"Error sending message: {e}")
-                        message_queue.put(message)
-                        break
-
-                await asyncio.sleep(0.1)
-                
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected normally")
-        finally:
-            keep_alive_task.cancel()
+        if after_timestamp:
+            query = query.gt('created_at', after_timestamp)
             
+        response = query.execute()
+        return response.data
     except Exception as e:
-        logger.error(f"WebSocket error: {e}\n{traceback.format_exc()}")
-    finally:
-        active_websockets.remove(websocket)
-        logger.info(f"WebSocket connection closed. Active connections: {len(active_websockets)}")
+        logger.error(f"Error fetching logs: {e}")
+        return []
 
-def run_trading_bot():
+@app.get("/status")
+async def get_status():
     try:
-        bot_status["running"] = True
-        bot_status["error"] = None
-        import sys
-        sys.stdout = TerminalPrinter(message_queue)
-        sys.stderr = TerminalPrinter(message_queue)
-        trading_bot.main()
+        response = supabase.table('bot_status').select('*').single().execute()
+        return response.data or {"running": False, "error": None}
     except Exception as e:
-        error_msg = f"Trading bot error: {str(e)}\n{traceback.format_exc()}"
+        logger.error(f"Error fetching status: {e}")
+        return {"running": False, "error": str(e)}
+
+async def run_trading_bot():
+    try:
+        # Обновляем статус
+        supabase.table('bot_status').upsert({
+            "id": 1,
+            "running": True,
+            "error": None,
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
+
+        # Создаем логгер
+        supabase_logger = SupabaseLogger()
+        
+        # Запускаем бота
+        import sys
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+
+        class AsyncPrinter:
+            async def write(self, text):
+                await supabase_logger.write(text)
+            
+            def flush(self):
+                pass
+
+        sys.stdout = AsyncPrinter()
+        sys.stderr = AsyncPrinter()
+        
+        # Запускаем бота в отдельном потоке
+        def bot_thread():
+            try:
+                trading_bot.main()
+            except Exception as e:
+                error_msg = f"Trading bot error: {str(e)}\n{traceback.format_exc()}"
+                supabase.table('bot_status').upsert({
+                    "id": 1,
+                    "error": error_msg,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).execute()
+                logger.error(error_msg)
+            finally:
+                # Восстанавливаем оригинальные stdout и stderr
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+
+        thread = threading.Thread(target=bot_thread)
+        thread.daemon = True
+        thread.start()
+
+    except Exception as e:
+        error_msg = f"Error starting bot: {str(e)}\n{traceback.format_exc()}"
+        supabase.table('bot_status').upsert({
+            "id": 1,
+            "error": error_msg,
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
         logger.error(error_msg)
-        bot_status["error"] = error_msg
-        message_queue.put({"message": error_msg, "error": True})
-    finally:
-        bot_status["running"] = False
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting trading bot...")
-    thread = threading.Thread(target=run_trading_bot, daemon=True)
-    thread.start()
+    await run_trading_bot()
 
 if __name__ == "__main__":
     import uvicorn
