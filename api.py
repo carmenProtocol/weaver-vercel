@@ -9,7 +9,8 @@ import traceback
 from typing import Optional
 import os
 from dotenv import load_dotenv
-from supabase import Client, create_client
+from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -26,8 +27,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY environment variables must be set")
 
-# Инициализируем Supabase клиент без прокси
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY, options={"headers": {"X-Client-Info": "supabase-py/1.0.3"}})
+# Инициализируем Supabase клиент
+options = ClientOptions(
+    schema='public',
+    headers={'X-Client-Info': 'supabase-py/1.0.3'},
+    persist_session=False,
+    auto_refresh_token=False,
+)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY, options=options)
 
 # HTML страница с интерфейсом
 HTML = """
