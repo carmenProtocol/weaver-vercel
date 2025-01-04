@@ -1,13 +1,17 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 import asyncio
 import json
-from typing import Set, Dict
+from typing import Set
 from datetime import datetime
 import main as trading_bot
 import threading
 from queue import Queue
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 active_websockets: Set[WebSocket] = set()
@@ -48,7 +52,8 @@ HTML = """
         <div id="terminal"></div>
         <script>
             const terminal = document.getElementById('terminal');
-            const ws = new WebSocket(`ws://${window.location.host}/ws`);
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
             
             ws.onmessage = function(event) {
                 const data = JSON.parse(event.data);
@@ -81,20 +86,30 @@ class TerminalPrinter:
     def write(self, text: str):
         if text.strip():  # Игнорируем пустые строки
             self.queue.put(text)
+            logger.info(text.strip())  # Дублируем в логи
 
     def flush(self):
         pass
 
 async def broadcast_message(message: str):
+    disconnected = set()
     for websocket in active_websockets:
         try:
             await websocket.send_json({"message": message})
-        except:
-            active_websockets.remove(websocket)
+        except Exception as e:
+            logger.error(f"Error broadcasting message: {e}")
+            disconnected.add(websocket)
+    
+    # Удаляем отключенные сокеты
+    active_websockets.difference_update(disconnected)
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def get():
-    return HTML
+    return HTMLResponse(HTML)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -106,20 +121,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 message = message_queue.get()
                 await websocket.send_json({"message": message})
             await asyncio.sleep(0.1)
-    except:
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
         active_websockets.remove(websocket)
 
 def run_trading_bot():
-    import sys
-    # Перенаправляем вывод в наш TerminalPrinter
-    sys.stdout = TerminalPrinter(message_queue)
-    sys.stderr = TerminalPrinter(message_queue)
-    # Запускаем торгового бота
-    trading_bot.main()
+    try:
+        import sys
+        sys.stdout = TerminalPrinter(message_queue)
+        sys.stderr = TerminalPrinter(message_queue)
+        trading_bot.main()
+    except Exception as e:
+        logger.error(f"Trading bot error: {e}")
+        message_queue.put(f"Error: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
-    # Запускаем торгового бота в отдельном потоке
+    logger.info("Starting trading bot...")
     thread = threading.Thread(target=run_trading_bot, daemon=True)
     thread.start()
 
