@@ -105,7 +105,7 @@ async def main(logger=None):
         # Создаем подключение к бирже
         exchange = create_okx_exchange()
         print("Проверка подключения к бирже...")
-        exchange.load_markets()
+        await exchange.load_markets()
         print("Подключение успешно!")
         
         if logger:
@@ -115,11 +115,11 @@ async def main(logger=None):
         executor = Executor(exchange)
         
         # Получаем начальные данные
-        current_price = get_current_price(exchange, SYMBOL)
+        current_price = await get_current_price(exchange, SYMBOL)
         if not current_price:
             raise Exception("Не удалось получить текущую цену")
         
-        usdt_balance, eth_balance = get_balance(exchange)
+        usdt_balance, eth_balance = await get_balance(exchange)
         initial_deposit = usdt_balance + (eth_balance * current_price)
         
         # Инициализируем состояние
@@ -136,10 +136,10 @@ async def main(logger=None):
         if eth_balance < state.initial_eth:
             eth_to_buy = state.initial_eth - eth_balance
             print(f"\n=== Выполняем начальную покупку {eth_to_buy:.6f} ETH ===")
-            executor.buy_eth(current_price, eth_to_buy)
+            await executor.buy_eth(current_price, eth_to_buy)
             
             # Обновляем балансы после покупки
-            usdt_balance, eth_balance = get_balance(exchange)
+            usdt_balance, eth_balance = await get_balance(exchange)
             state.update_balances(eth_balance, usdt_balance)
             
             print(f"Новый ETH баланс: {eth_balance:.6f} ETH (${eth_balance * current_price:.2f})")
@@ -156,7 +156,7 @@ async def main(logger=None):
                 current_time = time.time()
                 
                 # Получаем текущие данные рынка
-                current_price = scan_market(SYMBOL)
+                current_price = await scan_market(SYMBOL)
                 if not current_price:
                     error_msg = "Предупреждение: Не удалось получить текущую цену, пропускаем итерацию"
                     print(error_msg)
@@ -166,7 +166,7 @@ async def main(logger=None):
                 
                 # Получаем текущие балансы только если прошел интервал или была торговля
                 if current_time - last_status_time >= STATUS_INTERVAL:
-                    usdt_balance, eth_balance = get_balance(exchange)
+                    usdt_balance, eth_balance = await get_balance(exchange)
                     state.update_balances(eth_balance, usdt_balance)
                     pnl = calculate_pnl(state, initial_price)
                     await print_strategy_info(state, pnl, "Периодический статус", initial_price, logger)

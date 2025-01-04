@@ -253,26 +253,21 @@ async def run_trading_bot():
         sys.stdout = AsyncPrinter()
         sys.stderr = AsyncPrinter()
         
-        # Запускаем бота в отдельном потоке
-        def bot_thread():
-            try:
-                trading_bot.main()
-            except Exception as e:
-                error_msg = f"Trading bot error: {str(e)}\n{traceback.format_exc()}"
-                supabase.table('bot_status').upsert({
-                    "id": 1,
-                    "error": error_msg,
-                    "updated_at": datetime.utcnow().isoformat()
-                }).execute()
-                logger.error(error_msg)
-            finally:
-                # Восстанавливаем оригинальные stdout и stderr
-                sys.stdout = original_stdout
-                sys.stderr = original_stderr
-
-        thread = threading.Thread(target=bot_thread)
-        thread.daemon = True
-        thread.start()
+        try:
+            # Запускаем бота напрямую в асинхронном режиме
+            await trading_bot.main(logger=supabase_logger)
+        except Exception as e:
+            error_msg = f"Trading bot error: {str(e)}\n{traceback.format_exc()}"
+            supabase.table('bot_status').upsert({
+                "id": 1,
+                "error": error_msg,
+                "updated_at": datetime.utcnow().isoformat()
+            }).execute()
+            logger.error(error_msg)
+        finally:
+            # Восстанавливаем оригинальные stdout и stderr
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
     except Exception as e:
         error_msg = f"Error starting bot: {str(e)}\n{traceback.format_exc()}"
