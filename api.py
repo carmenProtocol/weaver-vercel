@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 active_websockets: Set[WebSocket] = set()
 message_queue = Queue()
+bot_status = {"running": False, "error": None}
 
 # HTML страница с терминальным интерфейсом
 HTML = """
@@ -46,34 +47,63 @@ HTML = """
             .message {
                 margin: 5px 0;
             }
+            .error {
+                color: #ff0000;
+            }
         </style>
     </head>
     <body>
         <div id="terminal"></div>
         <script>
-            const terminal = document.getElementById('terminal');
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-            
-            ws.onmessage = function(event) {
-                const data = JSON.parse(event.data);
-                const timestamp = new Date().toLocaleTimeString();
-                const messageDiv = document.createElement('div');
-                messageDiv.className = 'message';
-                messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${data.message}`;
-                terminal.appendChild(messageDiv);
-                terminal.scrollTop = terminal.scrollHeight;
-            };
-            
-            ws.onclose = function(event) {
-                const timestamp = new Date().toLocaleTimeString();
-                const messageDiv = document.createElement('div');
-                messageDiv.className = 'message';
-                messageDiv.style.color = '#ff0000';
-                messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> WebSocket connection closed. Reconnecting...`;
-                terminal.appendChild(messageDiv);
-                setTimeout(() => window.location.reload(), 5000);
-            };
+            let ws;
+            let reconnectAttempts = 0;
+            const maxReconnectAttempts = 5;
+            const reconnectDelay = 5000;
+
+            function connect() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+                
+                ws.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    const timestamp = new Date().toLocaleTimeString();
+                    const messageDiv = document.createElement('div');
+                    messageDiv.className = 'message';
+                    if (data.error) {
+                        messageDiv.className += ' error';
+                    }
+                    messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${data.message}`;
+                    terminal.appendChild(messageDiv);
+                    terminal.scrollTop = terminal.scrollHeight;
+                };
+                
+                ws.onclose = function(event) {
+                    const timestamp = new Date().toLocaleTimeString();
+                    const messageDiv = document.createElement('div');
+                    messageDiv.className = 'message';
+                    messageDiv.style.color = '#ff0000';
+                    messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> WebSocket connection closed. Reconnecting...`;
+                    terminal.appendChild(messageDiv);
+                    
+                    if (reconnectAttempts < maxReconnectAttempts) {
+                        reconnectAttempts++;
+                        setTimeout(connect, reconnectDelay);
+                    } else {
+                        messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> Failed to reconnect after ${maxReconnectAttempts} attempts. Please refresh the page.`;
+                    }
+                };
+
+                ws.onopen = function() {
+                    reconnectAttempts = 0;
+                    const timestamp = new Date().toLocaleTimeString();
+                    const messageDiv = document.createElement('div');
+                    messageDiv.className = 'message';
+                    messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> Connected to server`;
+                    terminal.appendChild(messageDiv);
+                };
+            }
+
+            connect();
         </script>
     </body>
 </html>
@@ -85,17 +115,17 @@ class TerminalPrinter:
 
     def write(self, text: str):
         if text.strip():  # Игнорируем пустые строки
-            self.queue.put(text)
+            self.queue.put({"message": text, "error": False})
             logger.info(text.strip())  # Дублируем в логи
 
     def flush(self):
         pass
 
-async def broadcast_message(message: str):
+async def broadcast_message(message: dict):
     disconnected = set()
     for websocket in active_websockets:
         try:
-            await websocket.send_json({"message": message})
+            await websocket.send_json(message)
         except Exception as e:
             logger.error(f"Error broadcasting message: {e}")
             disconnected.add(websocket)
@@ -109,7 +139,12 @@ async def get():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy" if bot_status["running"] and not bot_status["error"] else "unhealthy",
+        "bot_running": bot_status["running"],
+        "bot_error": bot_status["error"],
+        "timestamp": datetime.now().isoformat()
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -119,7 +154,7 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             if not message_queue.empty():
                 message = message_queue.get()
-                await websocket.send_json({"message": message})
+                await websocket.send_json(message)
             await asyncio.sleep(0.1)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
@@ -128,13 +163,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
 def run_trading_bot():
     try:
+        bot_status["running"] = True
+        bot_status["error"] = None
         import sys
         sys.stdout = TerminalPrinter(message_queue)
         sys.stderr = TerminalPrinter(message_queue)
         trading_bot.main()
     except Exception as e:
-        logger.error(f"Trading bot error: {e}")
-        message_queue.put(f"Error: {str(e)}")
+        error_msg = f"Trading bot error: {str(e)}"
+        logger.error(error_msg)
+        bot_status["error"] = error_msg
+        message_queue.put({"message": error_msg, "error": True})
+    finally:
+        bot_status["running"] = False
 
 @app.on_event("startup")
 async def startup_event():
