@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, WebSocketState
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
@@ -20,7 +20,7 @@ app = FastAPI()
 # Добавляем CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене лучше указать конкретные домены
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,7 +30,6 @@ active_websockets: Set[WebSocket] = set()
 message_queue = Queue()
 bot_status = {"running": False, "error": None}
 
-# HTML страница с терминальным интерфейсом
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -70,11 +69,12 @@ HTML = """
     <body>
         <div id="terminal"></div>
         <script>
-            let ws;
+            let ws = null;
             let reconnectAttempts = 0;
             const maxReconnectAttempts = 5;
             const reconnectDelay = 5000;
             const terminal = document.getElementById('terminal');
+            let pingInterval = null;
 
             function addMessage(message, type = 'normal') {
                 const timestamp = new Date().toLocaleTimeString();
@@ -85,68 +85,90 @@ HTML = """
                 terminal.scrollTop = terminal.scrollHeight;
             }
 
+            function setupPingInterval() {
+                if (pingInterval) {
+                    clearInterval(pingInterval);
+                }
+                pingInterval = setInterval(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        try {
+                            ws.send(JSON.stringify({ type: 'ping' }));
+                        } catch (e) {
+                            addMessage('Error sending ping: ' + e.message, 'error');
+                            ws.close();
+                        }
+                    }
+                }, 15000);
+            }
+
             function connect() {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.close();
+                }
+
                 addMessage('Connecting to server...', 'system');
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const wsUrl = `${protocol}//${window.location.host}/ws`;
                 addMessage(`Attempting to connect to ${wsUrl}`, 'system');
                 
-                ws = new WebSocket(wsUrl);
-                
-                // Увеличиваем таймаут
-                ws.timeout = 30000;
-                
-                ws.onmessage = function(event) {
-                    try {
-                        const data = JSON.parse(event.data);
-                        addMessage(data.message, data.error ? 'error' : 'normal');
-                    } catch (e) {
-                        addMessage('Error parsing message: ' + e.message, 'error');
-                    }
-                };
-                
-                ws.onclose = function(event) {
-                    const reason = event.reason || 'Unknown reason';
-                    const code = event.code;
-                    addMessage(`WebSocket connection closed. Code: ${code}, Reason: ${reason}`, 'error');
+                try {
+                    ws = new WebSocket(wsUrl);
                     
-                    if (reconnectAttempts < maxReconnectAttempts) {
-                        reconnectAttempts++;
-                        addMessage(`Reconnecting (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`, 'system');
-                        setTimeout(connect, reconnectDelay);
-                    } else {
-                        addMessage(`Failed to reconnect after ${maxReconnectAttempts} attempts. Please refresh the page.`, 'error');
-                    }
-                };
+                    ws.onmessage = function(event) {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'pong') {
+                                return; // Игнорируем pong сообщения в выводе
+                            }
+                            addMessage(data.message, data.error ? 'error' : 'normal');
+                        } catch (e) {
+                            addMessage('Error parsing message: ' + e.message, 'error');
+                        }
+                    };
+                    
+                    ws.onclose = function(event) {
+                        if (pingInterval) {
+                            clearInterval(pingInterval);
+                            pingInterval = null;
+                        }
 
-                ws.onerror = function(error) {
-                    addMessage('WebSocket error: ' + (error.message || 'Unknown error'), 'error');
-                    console.error('WebSocket error:', error);
-                };
+                        const reason = event.reason || 'Unknown reason';
+                        const code = event.code;
+                        addMessage(`WebSocket connection closed. Code: ${code}, Reason: ${reason}`, 'error');
+                        
+                        if (reconnectAttempts < maxReconnectAttempts) {
+                            reconnectAttempts++;
+                            const delay = reconnectDelay * reconnectAttempts;
+                            addMessage(`Reconnecting in ${delay/1000} seconds (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`, 'system');
+                            setTimeout(connect, delay);
+                        } else {
+                            addMessage(`Failed to reconnect after ${maxReconnectAttempts} attempts. Please refresh the page.`, 'error');
+                        }
+                    };
 
-                ws.onopen = function() {
-                    reconnectAttempts = 0;
-                    addMessage('Connected to server', 'system');
-                };
-            }
+                    ws.onerror = function(error) {
+                        addMessage('WebSocket error occurred', 'error');
+                        console.error('WebSocket error:', error);
+                    };
 
-            // Проверка состояния соединения каждые 30 секунд
-            setInterval(() => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    try {
-                        ws.send(JSON.stringify({ type: 'ping' }));
-                    } catch (e) {
-                        addMessage('Error sending ping: ' + e.message, 'error');
-                    }
+                    ws.onopen = function() {
+                        reconnectAttempts = 0;
+                        addMessage('Connected to server', 'system');
+                        setupPingInterval();
+                    };
+                } catch (e) {
+                    addMessage('Error creating WebSocket connection: ' + e.message, 'error');
                 }
-            }, 30000);
+            }
 
             connect();
 
-            // Обработка закрытия страницы
             window.onbeforeunload = function() {
                 if (ws) {
                     ws.close();
+                }
+                if (pingInterval) {
+                    clearInterval(pingInterval);
                 }
             };
         </script>
@@ -159,9 +181,9 @@ class TerminalPrinter:
         self.queue = queue
 
     def write(self, text: str):
-        if text.strip():  # Игнорируем пустые строки
+        if text.strip():
             self.queue.put({"message": text.strip(), "error": False})
-            logger.info(text.strip())  # Дублируем в логи
+            logger.info(text.strip())
 
     def flush(self):
         pass
@@ -170,12 +192,12 @@ async def broadcast_message(message: dict):
     disconnected = set()
     for websocket in active_websockets:
         try:
-            await websocket.send_json(message)
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json(message)
         except Exception as e:
             logger.error(f"Error broadcasting message: {e}")
             disconnected.add(websocket)
     
-    # Удаляем отключенные сокеты
     active_websockets.difference_update(disconnected)
 
 @app.get("/")
@@ -192,10 +214,18 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
+async def keep_alive(websocket: WebSocket):
+    try:
+        while True:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json({"type": "ping"})
+            await asyncio.sleep(15)
+    except Exception as e:
+        logger.error(f"Keep-alive error: {e}")
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     try:
-        # Логируем заголовки запроса
         logger.info(f"WebSocket headers: {websocket.headers}")
         logger.info(f"Client connecting from: {websocket.client}")
         
@@ -203,40 +233,44 @@ async def websocket_endpoint(websocket: WebSocket):
         active_websockets.add(websocket)
         logger.info(f"New WebSocket connection. Active connections: {len(active_websockets)}")
         
-        # Отправляем приветственное сообщение
         await websocket.send_json({"message": "Connected to Weaver Trading Bot", "error": False})
         
-        while True:
-            try:
-                # Проверяем входящие сообщения (например, ping)
-                data = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)  # Увеличили таймаут
-                if data.get("type") == "ping":
-                    await websocket.send_json({"type": "pong"})
-            except asyncio.TimeoutError:
-                # Проверяем, живо ли соединение
+        # Запускаем keep-alive в отдельной задаче
+        keep_alive_task = asyncio.create_task(keep_alive(websocket))
+        
+        try:
+            while True:
                 try:
-                    await websocket.send_json({"type": "ping"})
-                except Exception:
-                    raise WebSocketDisconnect()
-            except WebSocketDisconnect:
-                raise
-            except Exception as e:
-                logger.error(f"Error processing WebSocket message: {e}")
-                continue
+                    data = await websocket.receive_json()
+                    if data.get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+                        continue
+                        
+                    # Обработка других типов сообщений
+                    logger.info(f"Received message: {data}")
+                    
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON received")
+                    continue
+                    
+                # Отправляем сообщения из очереди
+                while not message_queue.empty():
+                    try:
+                        message = message_queue.get_nowait()
+                        if websocket.client_state == WebSocketState.CONNECTED:
+                            await websocket.send_json(message)
+                    except Exception as e:
+                        logger.error(f"Error sending message: {e}")
+                        message_queue.put(message)
+                        break
 
-            # Отправляем сообщения из очереди
-            while not message_queue.empty():
-                try:
-                    message = message_queue.get_nowait()
-                    await websocket.send_json(message)
-                except Exception as e:
-                    logger.error(f"Error sending message: {e}")
-                    message_queue.put(message)  # Возвращаем сообщение в очередь
-                    break
-
-            await asyncio.sleep(0.1)
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected normally")
+                await asyncio.sleep(0.1)
+                
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected normally")
+        finally:
+            keep_alive_task.cancel()
+            
     except Exception as e:
         logger.error(f"WebSocket error: {e}\n{traceback.format_exc()}")
     finally:
