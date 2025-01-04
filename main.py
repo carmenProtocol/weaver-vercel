@@ -25,13 +25,6 @@ STATUS_INTERVAL = 3600  # Status update interval in seconds
 async def print_strategy_info(state: State, pnl: Dict[str, float], message: str, initial_price: float, logger=None) -> None:
     """
     Выводит подробную информацию о состоянии стратегии.
-    
-    Args:
-        state: Текущее состояние стратегии
-        pnl: Словарь с метриками P&L
-        message: Сообщение о текущем действии стратегии
-        initial_price: Начальная цена
-        logger: Логгер для записи в Supabase
     """
     print(f"\n=== {message} ===")
     print(f"Текущая цена: ${state.current_price:.2f}")
