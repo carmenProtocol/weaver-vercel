@@ -1,9 +1,4 @@
 ccxt==2.4.96
-fastapi==0.103.2
-pydantic==1.10.13
-annotated-types==0.5.0
-uvicorn==0.27.1
-aiohttp==3.9.3
-websockets==8.1
-supabase-py==0.0.2
-python-dotenv==1.0.0 
+flask==3.0.0
+python-dotenv==1.0.0
+supabase-py==0.0.2 
