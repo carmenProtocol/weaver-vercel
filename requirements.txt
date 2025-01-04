@@ -1,7 +1,7 @@
 --only-binary=:all:
 ccxt==2.4.96
-numpy==1.24.3
-pandas==2.0.3
+numpy==2.2.1
+pandas==2.2.1
 python-dotenv==1.0.0
 fastapi==0.104.1
 uvicorn==0.24.0
