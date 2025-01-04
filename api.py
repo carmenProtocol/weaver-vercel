@@ -1,5 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
 from typing import Set
@@ -15,6 +16,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Добавляем CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # В продакшене лучше указать конкретные домены
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 active_websockets: Set[WebSocket] = set()
 message_queue = Queue()
 bot_status = {"running": False, "error": None}
@@ -77,7 +88,13 @@ HTML = """
             function connect() {
                 addMessage('Connecting to server...', 'system');
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+                const wsUrl = `${protocol}//${window.location.host}/ws`;
+                addMessage(`Attempting to connect to ${wsUrl}`, 'system');
+                
+                ws = new WebSocket(wsUrl);
+                
+                // Увеличиваем таймаут
+                ws.timeout = 30000;
                 
                 ws.onmessage = function(event) {
                     try {
@@ -89,7 +106,9 @@ HTML = """
                 };
                 
                 ws.onclose = function(event) {
-                    addMessage('WebSocket connection closed. ' + (event.reason || ''), 'error');
+                    const reason = event.reason || 'Unknown reason';
+                    const code = event.code;
+                    addMessage(`WebSocket connection closed. Code: ${code}, Reason: ${reason}`, 'error');
                     
                     if (reconnectAttempts < maxReconnectAttempts) {
                         reconnectAttempts++;
@@ -102,6 +121,7 @@ HTML = """
 
                 ws.onerror = function(error) {
                     addMessage('WebSocket error: ' + (error.message || 'Unknown error'), 'error');
+                    console.error('WebSocket error:', error);
                 };
 
                 ws.onopen = function() {
@@ -174,19 +194,30 @@ async def health_check():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    active_websockets.add(websocket)
-    logger.info(f"New WebSocket connection. Active connections: {len(active_websockets)}")
-    
     try:
+        # Логируем заголовки запроса
+        logger.info(f"WebSocket headers: {websocket.headers}")
+        logger.info(f"Client connecting from: {websocket.client}")
+        
+        await websocket.accept()
+        active_websockets.add(websocket)
+        logger.info(f"New WebSocket connection. Active connections: {len(active_websockets)}")
+        
+        # Отправляем приветственное сообщение
+        await websocket.send_json({"message": "Connected to Weaver Trading Bot", "error": False})
+        
         while True:
             try:
                 # Проверяем входящие сообщения (например, ping)
-                data = await asyncio.wait_for(websocket.receive_json(), timeout=0.1)
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)  # Увеличили таймаут
                 if data.get("type") == "ping":
                     await websocket.send_json({"type": "pong"})
             except asyncio.TimeoutError:
-                pass
+                # Проверяем, живо ли соединение
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    raise WebSocketDisconnect()
             except WebSocketDisconnect:
                 raise
             except Exception as e:
