@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import asyncio
 import json
@@ -8,6 +8,7 @@ import main as trading_bot
 import threading
 from queue import Queue
 import logging
+import traceback
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +51,9 @@ HTML = """
             .error {
                 color: #ff0000;
             }
+            .system {
+                color: #ffff00;
+            }
         </style>
     </head>
     <body>
@@ -59,51 +63,72 @@ HTML = """
             let reconnectAttempts = 0;
             const maxReconnectAttempts = 5;
             const reconnectDelay = 5000;
+            const terminal = document.getElementById('terminal');
+
+            function addMessage(message, type = 'normal') {
+                const timestamp = new Date().toLocaleTimeString();
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${type}`;
+                messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${message}`;
+                terminal.appendChild(messageDiv);
+                terminal.scrollTop = terminal.scrollHeight;
+            }
 
             function connect() {
+                addMessage('Connecting to server...', 'system');
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
                 
                 ws.onmessage = function(event) {
-                    const data = JSON.parse(event.data);
-                    const timestamp = new Date().toLocaleTimeString();
-                    const messageDiv = document.createElement('div');
-                    messageDiv.className = 'message';
-                    if (data.error) {
-                        messageDiv.className += ' error';
+                    try {
+                        const data = JSON.parse(event.data);
+                        addMessage(data.message, data.error ? 'error' : 'normal');
+                    } catch (e) {
+                        addMessage('Error parsing message: ' + e.message, 'error');
                     }
-                    messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${data.message}`;
-                    terminal.appendChild(messageDiv);
-                    terminal.scrollTop = terminal.scrollHeight;
                 };
                 
                 ws.onclose = function(event) {
-                    const timestamp = new Date().toLocaleTimeString();
-                    const messageDiv = document.createElement('div');
-                    messageDiv.className = 'message';
-                    messageDiv.style.color = '#ff0000';
-                    messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> WebSocket connection closed. Reconnecting...`;
-                    terminal.appendChild(messageDiv);
+                    addMessage('WebSocket connection closed. ' + (event.reason || ''), 'error');
                     
                     if (reconnectAttempts < maxReconnectAttempts) {
                         reconnectAttempts++;
+                        addMessage(`Reconnecting (attempt ${reconnectAttempts}/${maxReconnectAttempts})...`, 'system');
                         setTimeout(connect, reconnectDelay);
                     } else {
-                        messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> Failed to reconnect after ${maxReconnectAttempts} attempts. Please refresh the page.`;
+                        addMessage(`Failed to reconnect after ${maxReconnectAttempts} attempts. Please refresh the page.`, 'error');
                     }
+                };
+
+                ws.onerror = function(error) {
+                    addMessage('WebSocket error: ' + (error.message || 'Unknown error'), 'error');
                 };
 
                 ws.onopen = function() {
                     reconnectAttempts = 0;
-                    const timestamp = new Date().toLocaleTimeString();
-                    const messageDiv = document.createElement('div');
-                    messageDiv.className = 'message';
-                    messageDiv.innerHTML = `<span class="timestamp">[${timestamp}]</span> Connected to server`;
-                    terminal.appendChild(messageDiv);
+                    addMessage('Connected to server', 'system');
                 };
             }
 
+            // Проверка состояния соединения каждые 30 секунд
+            setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    try {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    } catch (e) {
+                        addMessage('Error sending ping: ' + e.message, 'error');
+                    }
+                }
+            }, 30000);
+
             connect();
+
+            // Обработка закрытия страницы
+            window.onbeforeunload = function() {
+                if (ws) {
+                    ws.close();
+                }
+            };
         </script>
     </body>
 </html>
@@ -115,7 +140,7 @@ class TerminalPrinter:
 
     def write(self, text: str):
         if text.strip():  # Игнорируем пустые строки
-            self.queue.put({"message": text, "error": False})
+            self.queue.put({"message": text.strip(), "error": False})
             logger.info(text.strip())  # Дублируем в логи
 
     def flush(self):
@@ -143,6 +168,7 @@ async def health_check():
         "status": "healthy" if bot_status["running"] and not bot_status["error"] else "unhealthy",
         "bot_running": bot_status["running"],
         "bot_error": bot_status["error"],
+        "connections": len(active_websockets),
         "timestamp": datetime.now().isoformat()
     }
 
@@ -150,16 +176,41 @@ async def health_check():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     active_websockets.add(websocket)
+    logger.info(f"New WebSocket connection. Active connections: {len(active_websockets)}")
+    
     try:
         while True:
-            if not message_queue.empty():
-                message = message_queue.get()
-                await websocket.send_json(message)
+            try:
+                # Проверяем входящие сообщения (например, ping)
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=0.1)
+                if data.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                pass
+            except WebSocketDisconnect:
+                raise
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message: {e}")
+                continue
+
+            # Отправляем сообщения из очереди
+            while not message_queue.empty():
+                try:
+                    message = message_queue.get_nowait()
+                    await websocket.send_json(message)
+                except Exception as e:
+                    logger.error(f"Error sending message: {e}")
+                    message_queue.put(message)  # Возвращаем сообщение в очередь
+                    break
+
             await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected normally")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}\n{traceback.format_exc()}")
     finally:
         active_websockets.remove(websocket)
+        logger.info(f"WebSocket connection closed. Active connections: {len(active_websockets)}")
 
 def run_trading_bot():
     try:
@@ -170,7 +221,7 @@ def run_trading_bot():
         sys.stderr = TerminalPrinter(message_queue)
         trading_bot.main()
     except Exception as e:
-        error_msg = f"Trading bot error: {str(e)}"
+        error_msg = f"Trading bot error: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_msg)
         bot_status["error"] = error_msg
         message_queue.put({"message": error_msg, "error": True})
