@@ -4,14 +4,12 @@ import asyncio
 import json
 from datetime import datetime
 import main as trading_bot
-import threading
 import logging
 import traceback
 from typing import Optional
 import os
 from dotenv import load_dotenv
 from supabase import Client, create_client
-import asyncpg
 
 # Загружаем переменные окружения
 load_dotenv()
